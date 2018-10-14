@@ -2,50 +2,59 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/binary"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/fullsailor/pkcs7"
 )
 
 func main() {
 
-	files := []string{"example.csv", "data.csv"}
-	output := "done.zip"
-
 	var mode string
-	flag.StringVar(
-		&mode, "mode", "",
-		"")
+	flag.StringVar(&mode, "mode", "i", "")
+
+	var hash string
+	flag.StringVar(&hash, "hash", "", "")
+
+	var cert string
+	flag.StringVar(&cert, "cert", "", "")
+
+	var pkey string
+	flag.StringVar(&pkey, "pkey", "", "")
+
+	var path string
+	flag.StringVar(&path, "path", "", "")
 
 	flag.Parse()
-	switch mode {
 
+	switch mode {
 	// Files to Zip
 	case "z":
 		{
+			makeSzip()
 
-			err := ZipFiles(output, files)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			log.Println("Zipped File: " + output)
 			break
 		}
-
 	//Unzip
 	case "x":
 		{
-			files, err := Unzip(output, "output-folder")
-			if err != nil {
-				log.Fatal(err)
-			}
 
-			fmt.Println("Unzipped:\n" + strings.Join(files, "\n"))
+			break
+		}
+	//Info
+	case "i":
+		{
+			fmt.Print("Info:\n")
+
 			break
 		}
 	default:
@@ -56,112 +65,193 @@ func main() {
 
 }
 
-// ZipFiles compresses one or many files into a single zip archive file.
-// Param 1: filename is the output zip file's name.
-// Param 2: files is a list of files to add to the zip.
-func ZipFiles(filename string, files []string) error {
-
-	newZipFile, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer newZipFile.Close()
-
-	zipWriter := zip.NewWriter(newZipFile)
-	defer zipWriter.Close()
-
-	// Add files to zip
-	for _, file := range files {
-
-		zipfile, err := os.Open(file)
-		if err != nil {
-			return err
-		}
-		defer zipfile.Close()
-
-		// Get the file information
-		info, err := zipfile.Stat()
-		if err != nil {
-			return err
-		}
-
-		header, err := zip.FileInfoHeader(info)
-		if err != nil {
-			return err
-		}
-
-		header.Name = file
-
-		header.Method = zip.Deflate
-
-		writer, err := zipWriter.CreateHeader(header)
-		if err != nil {
-			return err
-		}
-		if _, err = io.Copy(writer, zipfile); err != nil {
-			return err
-		}
-	}
-	return nil
+type fileCollector struct {
+	ZipBuf   *bytes.Buffer
+	Zip      *zip.Writer
+	MetaData []*FileMeta
 }
 
-// Unzip will decompress a zip archive, moving all files and folders
-// within the zip file (parameter 1) to an output directory (parameter 2).
-func Unzip(src string, dest string) ([]string, error) {
+func NewFileCollector() *fileCollector {
 
-	var filenames []string
+	buf := new(bytes.Buffer)
 
-	r, err := zip.OpenReader(src)
-	if err != nil {
-		return filenames, err
+	return &fileCollector{
+		ZipBuf:   buf,
+		Zip:      zip.NewWriter(buf),
+		MetaData: make([]*FileMeta, 0, 100),
 	}
-	defer r.Close()
+}
 
-	for _, f := range r.File {
+func (f *fileCollector) zipFiles(filename string, fileReader io.Reader) (err error) {
 
-		rc, err := f.Open()
-		if err != nil {
-			return filenames, err
+	var fileWriter io.Writer
+
+	if fileWriter, err = f.Zip.Create(filename); err != nil {
+		return
+	}
+
+	if _, err = io.Copy(fileWriter, fileReader); err != nil {
+		return
+	}
+
+	return
+}
+
+func (f *fileCollector) zipData() (Data []byte, err error) {
+
+	if err = f.Zip.Close(); err != nil {
+		return
+	}
+	Data = f.ZipBuf.Bytes()
+
+	return
+}
+
+func wolkFiles(collector *fileCollector, path string) (err error) {
+	var files []os.FileInfo
+
+	if files, err = ioutil.ReadDir(path); err != nil {
+		return
+	}
+
+	for i := range files {
+
+		full := filepath.Join(path, files[i].Name())
+
+		fmt.Println(full)
+
+		if files[i].IsDir() {
+			if err = wolkFiles(collector, full); err != nil {
+				return
+			}
 		}
-		defer rc.Close()
 
-		// Store filename/path for returning and using later on
-		fpath := filepath.Join(dest, f.Name)
+		collector.addMeta(full)
 
-		// Check for ZipSlip. More Info: http://bit.ly/2MsjAWE
-		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
-			return filenames, fmt.Errorf("%s: illegal file path", fpath)
+		var fileReader *os.File
+		if fileReader, err = os.Open(full); err != nil {
+			return
 		}
 
-		filenames = append(filenames, fpath)
-
-		if f.FileInfo().IsDir() {
-
-			// Make Folder
-			os.MkdirAll(fpath, os.ModePerm)
-
-		} else {
-
-			// Make File
-			if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
-				return filenames, err
-			}
-
-			outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-			if err != nil {
-				return filenames, err
-			}
-
-			_, err = io.Copy(outFile, rc)
-
-			// Close the file without defer to close before next iteration of loop
-			outFile.Close()
-
-			if err != nil {
-				return filenames, err
-			}
-
+		if err = collector.zipFiles(full, fileReader); err != nil {
+			return
 		}
 	}
-	return filenames, nil
+	return
+}
+
+type FileMeta struct {
+	Name string `xml:"filename"`
+}
+
+func (f *fileCollector) meta2XML() (XML []byte, err error) {
+
+	return xml.Marshal(f.MetaData)
+
+}
+
+func (f *fileCollector) addMeta(fullPath string) {
+
+	f.MetaData = append(f.MetaData, &FileMeta{
+		Name: fullPath,
+	})
+
+	return
+}
+
+func makeSzip() (err error) {
+
+	collector := NewFileCollector()
+
+	if err = wolkFiles(collector, "./test"); err != nil {
+		return
+	}
+
+	var XML []byte
+
+	if XML, err = collector.meta2XML(); err != nil {
+		return
+	}
+
+	fmt.Printf("metaLen = %d\n", len(XML))
+
+	metaCollector := NewFileCollector()
+
+	if err = metaCollector.zipFiles("meta.xml", bytes.NewReader(XML)); err != nil {
+		return
+	}
+
+	var metaZip []byte
+
+	if metaZip, err = metaCollector.zipData(); err != nil {
+		return
+	}
+
+	metaLen := len(metaZip)
+
+	fmt.Printf("metaLen = %d\n", metaLen)
+
+	var zipData []byte
+
+	if zipData, err = collector.zipData(); err != nil {
+		return
+	}
+
+	resultBuf := new(bytes.Buffer)
+
+	if err = binary.Write(resultBuf, binary.LittleEndian, uint32(metaLen)); err != nil {
+		return
+	}
+
+	if _, err = resultBuf.Write(metaZip); err != nil {
+		return
+	}
+
+	if _, err = resultBuf.Write(zipData); err != nil {
+		return
+	}
+
+	var signedData []byte
+
+	if signedData, err = signData(resultBuf.Bytes()); err != nil {
+		return
+	}
+
+	if err = ioutil.WriteFile("test.szp", signedData, 0644); err != nil {
+		return
+	}
+
+	return
+}
+
+func signData(data []byte) (signed []byte, err error) {
+
+	var signedData *pkcs7.SignedData
+
+	if signedData, err = pkcs7.NewSignedData(data); err != nil {
+		return
+	}
+
+	var cert tls.Certificate
+
+	if cert, err = tls.LoadX509KeyPair("./my.crt", "./my.key"); err != nil {
+		return
+	}
+
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("Не удалось загрузить сертификат")
+	}
+
+	rsaKey := cert.PrivateKey
+	var rsaCert *x509.Certificate
+
+	if rsaCert, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+		return
+	}
+
+	if err = signedData.AddSigner(rsaCert, rsaKey, pkcs7.SignerInfoConfig{}); err != nil {
+		return
+	}
+
+	return signedData.Finish()
 }
