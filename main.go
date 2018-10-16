@@ -13,6 +13,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/fullsailor/pkcs7"
 )
@@ -41,7 +42,6 @@ func main() {
 	case "z":
 		{
 			makeSzip()
-
 			break
 		}
 	//Unzip
@@ -126,7 +126,7 @@ func wolkFiles(collector *fileCollector, path string) (err error) {
 			}
 		}
 
-		collector.addMeta(full)
+		collector.addMeta(full, files[i].Size(), files[i].ModTime())
 
 		var fileReader *os.File
 		if fileReader, err = os.Open(full); err != nil {
@@ -141,7 +141,9 @@ func wolkFiles(collector *fileCollector, path string) (err error) {
 }
 
 type FileMeta struct {
-	Name string `xml:"filename"`
+	Name         string    `xml:"filename"`
+	OriginalSize int64     `xml:"original_size"`
+	ModTime      time.Time `xml:"mod_time"`
 }
 
 func (f *fileCollector) meta2XML() (XML []byte, err error) {
@@ -150,10 +152,12 @@ func (f *fileCollector) meta2XML() (XML []byte, err error) {
 
 }
 
-func (f *fileCollector) addMeta(fullPath string) {
+func (f *fileCollector) addMeta(fullPath string, originalSize int64, modTime time.Time) {
 
 	f.MetaData = append(f.MetaData, &FileMeta{
-		Name: fullPath,
+		Name:         fullPath,
+		OriginalSize: originalSize,
+		ModTime:      modTime,
 	})
 
 	return
