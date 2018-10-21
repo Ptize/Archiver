@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -11,9 +12,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
-	"time"
+	"strings"
 
 	"github.com/fullsailor/pkcs7"
 )
@@ -27,10 +29,10 @@ func main() {
 	flag.StringVar(&hash, "hash", "", "")
 
 	var cert string
-	flag.StringVar(&cert, "cert", "", "")
+	flag.StringVar(&cert, "cert", "./my.crt", "")
 
 	var pkey string
-	flag.StringVar(&pkey, "pkey", "", "")
+	flag.StringVar(&pkey, "pkey", "./my.key", "")
 
 	var path string
 	flag.StringVar(&path, "path", "", "")
@@ -41,7 +43,7 @@ func main() {
 	// Files to Zip
 	case "z":
 		{
-			makeSzip()
+			makeSzip(cert, pkey)
 			break
 		}
 	//Unzip
@@ -53,12 +55,44 @@ func main() {
 	//Info
 	case "i":
 		{
-			fmt.Print("Info:\n")
+			sign, err := Verify()
 
+			if err != nil {
+
+				log.Printf(err.Error())
+
+				return
+			}
+
+			if hash != "" {
+
+				signer := sign.GetOnlySigner()
+
+				if hash == strings.ToUpper(fmt.Sprintf("%x", sha1.Sum(signer.Raw))) {
+
+					fmt.Println("Хеши одинаковы")
+
+				} else {
+					fmt.Println("Хеши не совпадают")
+				}
+			}
+
+			data := sign.Content
+
+			buf, err := ReadMeta(data)
+			if err != nil {
+
+				log.Printf(err.Error())
+
+				return
+			}
+
+			fmt.Printf(string(buf.Bytes()))
 			break
 		}
 	default:
 		{
+			fmt.Print("Неизвестная команда\n")
 			break
 		}
 	}
@@ -126,7 +160,7 @@ func wolkFiles(collector *fileCollector, path string) (err error) {
 			}
 		}
 
-		collector.addMeta(full, files[i].Size(), files[i].ModTime())
+		collector.addMeta(full, files[i].Size(), files[i].ModTime().Format("2006-01-02 15:04:05"))
 
 		var fileReader *os.File
 		if fileReader, err = os.Open(full); err != nil {
@@ -141,9 +175,9 @@ func wolkFiles(collector *fileCollector, path string) (err error) {
 }
 
 type FileMeta struct {
-	Name         string    `xml:"filename"`
-	OriginalSize int64     `xml:"original_size"`
-	ModTime      time.Time `xml:"mod_time"`
+	Name         string `xml:"filename"`
+	OriginalSize int64  `xml:"original_size"`
+	ModTime      string `xml:"mod_time"`
 }
 
 func (f *fileCollector) meta2XML() (XML []byte, err error) {
@@ -152,7 +186,7 @@ func (f *fileCollector) meta2XML() (XML []byte, err error) {
 
 }
 
-func (f *fileCollector) addMeta(fullPath string, originalSize int64, modTime time.Time) {
+func (f *fileCollector) addMeta(fullPath string, originalSize int64, modTime string) {
 
 	f.MetaData = append(f.MetaData, &FileMeta{
 		Name:         fullPath,
@@ -163,7 +197,7 @@ func (f *fileCollector) addMeta(fullPath string, originalSize int64, modTime tim
 	return
 }
 
-func makeSzip() (err error) {
+func makeSzip(sert string, pkey string) (err error) {
 
 	collector := NewFileCollector()
 
@@ -217,7 +251,7 @@ func makeSzip() (err error) {
 
 	var signedData []byte
 
-	if signedData, err = signData(resultBuf.Bytes()); err != nil {
+	if signedData, err = signData(resultBuf.Bytes(), sert, pkey); err != nil {
 		return
 	}
 
@@ -228,7 +262,7 @@ func makeSzip() (err error) {
 	return
 }
 
-func signData(data []byte) (signed []byte, err error) {
+func signData(data []byte, certif string, pkey string) (signed []byte, err error) {
 
 	var signedData *pkcs7.SignedData
 
@@ -238,7 +272,7 @@ func signData(data []byte) (signed []byte, err error) {
 
 	var cert tls.Certificate
 
-	if cert, err = tls.LoadX509KeyPair("./my.crt", "./my.key"); err != nil {
+	if cert, err = tls.LoadX509KeyPair(certif, pkey); err != nil {
 		return
 	}
 
@@ -258,4 +292,84 @@ func signData(data []byte) (signed []byte, err error) {
 	}
 
 	return signedData.Finish()
+}
+
+func Verify() (sign *pkcs7.PKCS7, err error) {
+
+	szip, err := ioutil.ReadFile("test.szp")
+
+	if err != nil {
+
+		log.Printf("Unable to read zip")
+
+		return nil, err
+
+	}
+
+	sign, err = pkcs7.Parse(szip)
+
+	if err != nil {
+
+		log.Printf("Sign is broken!")
+
+		return sign, err
+
+	}
+
+	err = sign.Verify()
+
+	if err != nil {
+
+		log.Printf("Sign is not verified")
+
+		return sign, err
+
+	}
+
+	return sign, nil
+
+}
+
+func ReadMeta(data []byte) (*bytes.Buffer, error) {
+
+	mlen := binary.LittleEndian.Uint32(data[:4]) //получаю длину метаданных
+
+	bmeta := data[4 : mlen+4] //получаю байты метаданных
+
+	m, err := zip.NewReader(bytes.NewReader(bmeta), int64(len(bmeta)))
+
+	if err != nil {
+
+		log.Printf("Can not open meta")
+
+		return nil, err
+
+	}
+
+	f := m.File[0]
+
+	buf := new(bytes.Buffer)
+
+	st, err := f.Open()
+
+	if err != nil {
+
+		log.Printf(err.Error())
+
+		return nil, err
+
+	}
+
+	_, err = io.Copy(buf, st)
+
+	if err != nil {
+
+		log.Printf(err.Error())
+
+		return nil, err
+
+	}
+
+	return buf, nil
+
 }
