@@ -6,8 +6,10 @@ import (
 	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -49,7 +51,15 @@ func main() {
 	//Unzip
 	case "x":
 		{
+			err := Extract("./extract/", hash, cert, pkey)
 
+			if err != nil {
+
+				log.Printf(err.Error())
+
+				return
+
+			}
 			break
 		}
 	//Info
@@ -160,7 +170,13 @@ func wolkFiles(collector *fileCollector, path string) (err error) {
 			}
 		}
 
-		collector.addMeta(full, files[i].Size(), files[i].ModTime().Format("2006-01-02 15:04:05"))
+		var dataForHash []byte
+		if dataForHash, err = ioutil.ReadFile(full); err != nil {
+			return
+		}
+
+		s := sha1.Sum(dataForHash)
+		collector.addMeta(full, files[i].Size(), files[i].ModTime().Format("2006-01-02 15:04:05"), base64.URLEncoding.EncodeToString(s[:]))
 
 		var fileReader *os.File
 		if fileReader, err = os.Open(full); err != nil {
@@ -178,6 +194,7 @@ type FileMeta struct {
 	Name         string `xml:"filename"`
 	OriginalSize int64  `xml:"original_size"`
 	ModTime      string `xml:"mod_time"`
+	Hash         string `xml:"hash"`
 }
 
 func (f *fileCollector) meta2XML() (XML []byte, err error) {
@@ -186,12 +203,13 @@ func (f *fileCollector) meta2XML() (XML []byte, err error) {
 
 }
 
-func (f *fileCollector) addMeta(fullPath string, originalSize int64, modTime string) {
+func (f *fileCollector) addMeta(fullPath string, originalSize int64, modTime string, hash string) {
 
 	f.MetaData = append(f.MetaData, &FileMeta{
 		Name:         fullPath,
 		OriginalSize: originalSize,
 		ModTime:      modTime,
+		Hash:         hash,
 	})
 
 	return
@@ -372,4 +390,162 @@ func ReadMeta(data []byte) (*bytes.Buffer, error) {
 
 	return buf, nil
 
+}
+
+func CheckSzp(szpLocation string, hash string, certif string, pkey string) (error, *pkcs7.PKCS7) {
+	szp, err := ioutil.ReadFile(szpLocation)
+	if err != nil {
+		return err, nil
+	}
+
+	sign, err := pkcs7.Parse(szp)
+	if err != nil {
+		return err, nil
+	}
+
+	err = sign.Verify()
+	if err != nil {
+		return err, nil
+	}
+
+	signer := sign.GetOnlySigner()
+	if signer == nil {
+		return errors.New("Unable to obtain a single signer"), nil
+	}
+
+	if hash != "" {
+		hash2 := strings.ToUpper(fmt.Sprintf("%x", sha1.Sum(signer.Raw)))
+		if hash != hash2 {
+			fmt.Printf(hash2)
+			return errors.New("Certificate hash is corrupted"), nil
+		}
+	}
+
+	crt, err := tls.LoadX509KeyPair(certif, pkey)
+	if err != nil {
+		return err, nil
+	}
+
+	parsedCrt, err := x509.ParseCertificate(crt.Certificate[0])
+	if err != nil {
+		return err, nil
+	}
+
+	if bytes.Compare(parsedCrt.Raw, signer.Raw) != 0 {
+		return errors.New("Certificates don't match"), nil
+	}
+	return nil, sign
+}
+
+func GetMeta(p *pkcs7.PKCS7) (error, []FileMeta) {
+	//Read meta
+	metaSize := int32(binary.LittleEndian.Uint32(p.Content[:4]))
+	bytedMeta := bytes.NewReader(p.Content[4 : metaSize+4])
+
+	readableMeta, err := zip.NewReader(bytedMeta, bytedMeta.Size())
+	if err != nil {
+		return err, nil
+	}
+
+	metaCompressed := readableMeta.File[0] //meta.json
+
+	metaUncompressed, err := metaCompressed.Open()
+	if err != nil {
+		return err, nil
+	}
+
+	var fileMetas []FileMeta
+	metaUncompressedBody, err := ioutil.ReadAll(metaUncompressed)
+	if err != nil {
+		return err, nil
+	}
+	err = xml.Unmarshal(metaUncompressedBody, &fileMetas)
+	if err != nil {
+		return err, nil
+	}
+
+	return err, fileMetas
+}
+
+func Extract(destination string, hash string, certif string, pkey string) error {
+	err, sign := CheckSzp("test.szp", hash, certif, pkey)
+	if err != nil {
+		return err
+	}
+
+	err, fileMetas := GetMeta(sign)
+	if err != nil {
+		return err
+	}
+
+	metaSize := int32(binary.LittleEndian.Uint32(sign.Content[:4]))
+
+	archivedFiles := bytes.NewReader(sign.Content[4+metaSize:])
+
+	err = UnarchiveFiles(archivedFiles, fileMetas, destination)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func UnarchiveFiles(archive *bytes.Reader, fileMetas []FileMeta, destination string) error {
+	zipReader, err := zip.NewReader(archive, archive.Size())
+	if err != nil {
+		return err
+	}
+
+	// Creating folder to extract to
+	if err = os.MkdirAll(destination, 0770); err != nil {
+		fmt.Println("Couldn't create a folder to extract to")
+		return err
+	}
+
+	for _, file := range zipReader.File {
+		fileInfo := file.FileInfo()
+		dirName, fileBaseName := filepath.Split(fileInfo.Name())
+
+		if dirName != "" {
+			if err = os.MkdirAll(filepath.Join(destination, "/", dirName), 077); err != nil {
+				fmt.Println("Couldn't extract a folder")
+				return err
+			}
+		}
+
+		accessFile, err := file.Open() // gives io.ReadCloser
+		if err != nil {
+			fmt.Println("Unable to access a file")
+			return err
+		}
+
+		fileGuts, err := ioutil.ReadAll(accessFile) // read file's bytes to buffer
+		if err != nil {
+			fmt.Println("Unable to read a file")
+			return err
+		}
+
+		// Verifying hash for each file
+		for _, metaData := range fileMetas {
+			if metaData.Name == fileBaseName {
+				if metaData.Hash != strings.ToUpper(fmt.Sprintf("%x", sha1.Sum(fileGuts))) {
+					return errors.New(filepath.Join(file.Name, "'s has is corrupted. The archive can't be fully unszipped"))
+				}
+			}
+		}
+
+		outFile, err := os.Create(filepath.Join(destination, "/", fileInfo.Name()))
+		if err != nil {
+			fmt.Println("Error occured when trying to create a file")
+			return err
+		}
+		defer outFile.Close()
+
+		if _, err = outFile.Write(fileGuts); err != nil {
+			fmt.Println("A file died on surgical table")
+			return err
+		}
+
+	}
+
+	return nil
 }
